@@ -5,7 +5,6 @@ LABEL org.opencontainers.image.source https://github.com/microsoft/msquic
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
-    apt-get install -y gcc-multilib && \
     apt-get install --no-install-recommends -y apt-transport-https \
     ca-certificates \
     gnupg \
@@ -39,6 +38,7 @@ RUN apt-get update && \
     cppcheck \
     clang-tidy \
     gdb \
+    gcc-multilib \
     libnl-3-dev \
     libnl-genl-3-dev \
     libnl-route-3-dev \
@@ -48,9 +48,6 @@ RUN apt-get update && \
     m4 \
     libpcap-dev \
     libelf-dev \
-    iproute2 \
-    iptables \
-    ethertool \
   && rm -rf /var/lib/apt/lists/*
 
 RUN gem install fpm
