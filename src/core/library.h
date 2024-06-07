@@ -553,6 +553,24 @@ QuicLibraryGetBinding(
     _Out_ QUIC_BINDING** NewBinding
     );
 
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicLibraryCreateBinding(
+    _In_ const CXPLAT_UDP_CONFIG* UdpConfig,
+    _Out_ QUIC_BINDING** NewBinding
+    );
+
+//
+// Clone the binding for the addresses.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicLibraryCloneBinding(
+    _In_ QUIC_BINDING* OldBinding,
+    _Inout_ CXPLAT_ROUTE* Route,
+    _Out_ QUIC_BINDING** NewBinding
+    );
+
 //
 // Tries to acquire a ref on the binding. Fails if already starting the clean up
 // process.

@@ -636,6 +636,13 @@ CxPlatSocketGetRemoteAddress(
     _Out_ QUIC_ADDR* Address
     );
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
+CxPlatSocketSetRoute(
+    _In_ CXPLAT_SOCKET* Socket,
+    _Inout_ CXPLAT_ROUTE* Route
+    );
+
 //
 // Called to return a chain of datagrams received from the registered receive
 // callback.

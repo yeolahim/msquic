@@ -1874,6 +1874,56 @@ QuicLibraryLookupBinding(
     return NULL;
 }
 
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_BINDING*
+QuicLibraryLookupBindingStrong(
+#ifdef QUIC_COMPARTMENT_ID
+    _In_ QUIC_COMPARTMENT_ID CompartmentId,
+#endif
+    _In_ const QUIC_ADDR* LocalAddress,
+    _In_opt_ const QUIC_ADDR* RemoteAddress
+    )
+{
+    for (CXPLAT_LIST_ENTRY* Link = MsQuicLib.Bindings.Flink;
+        Link != &MsQuicLib.Bindings;
+        Link = Link->Flink) {
+
+        QUIC_BINDING* Binding =
+            CXPLAT_CONTAINING_RECORD(Link, QUIC_BINDING, Link);
+
+#ifdef QUIC_COMPARTMENT_ID
+        if (CompartmentId != Binding->CompartmentId) {
+            continue;
+        }
+#endif
+
+        QUIC_ADDR BindingLocalAddr;
+        QuicBindingGetLocalAddress(Binding, &BindingLocalAddr);
+
+        if (Binding->Connected) {
+            //
+            // For client/connected bindings we need to match on both local and
+            // remote addresses/ports.
+            //
+            if (RemoteAddress &&
+                QuicAddrCompare(LocalAddress, &BindingLocalAddr)) {
+                QUIC_ADDR BindingRemoteAddr;
+                QuicBindingGetRemoteAddress(Binding, &BindingRemoteAddr);
+                if (QuicAddrCompare(RemoteAddress, &BindingRemoteAddr)) {
+                    return Binding;
+                }
+            }
+
+        } else {
+            if (QuicAddrCompare(LocalAddress, &BindingLocalAddr)) {
+                return Binding;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 _IRQL_requires_max_(PASSIVE_LEVEL)
 QUIC_STATUS
 QuicLibraryGetBinding(
@@ -1883,7 +1933,6 @@ QuicLibraryGetBinding(
 {
     QUIC_STATUS Status;
     QUIC_BINDING* Binding;
-    QUIC_ADDR NewLocalAddress;
     const BOOLEAN PortUnspecified =
         UdpConfig->LocalAddress == NULL || QuicAddrGetPort(UdpConfig->LocalAddress) == 0;
     const BOOLEAN ShareBinding = !!(UdpConfig->Flags & CXPLAT_SOCKET_FLAG_SHARE);
@@ -1970,17 +2019,47 @@ NewBinding:
     //
 
     Status =
-        QuicBindingInitialize(
+        QuicLibraryCreateBinding(
             UdpConfig,
             NewBinding);
     if (QUIC_FAILED(Status)) {
 #ifdef QUIC_SHARED_EPHEMERAL_WORKAROUND
+        if (!SharedEphemeralWorkAround && (QUIC_STATUS_ADDRESS_IN_USE == Status))
+            SharedEphemeralWorkAround = TRUE;
         if (SharedEphemeralWorkAround) {
             CXPLAT_DBG_ASSERT(UdpConfig->LocalAddress);
             QuicAddrSetPort((QUIC_ADDR*)UdpConfig->LocalAddress, QuicAddrGetPort(UdpConfig->LocalAddress) + 1);
             goto SharedEphemeralRetry;
         }
 #endif // QUIC_SHARED_EPHEMERAL_WORKAROUND
+        goto Exit;
+    }
+
+Exit:
+
+    return Status;
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicLibraryCreateBinding(
+    _In_ const CXPLAT_UDP_CONFIG* UdpConfig,
+    _Out_ QUIC_BINDING** NewBinding
+    )
+{
+    //
+    // Create a new binding since there wasn't a match.
+    //
+    QUIC_ADDR NewLocalAddress;
+    QUIC_BINDING* Binding;
+    const BOOLEAN PortUnspecified =
+        UdpConfig->LocalAddress == NULL || QuicAddrGetPort(UdpConfig->LocalAddress) == 0;
+
+    QUIC_STATUS Status =
+        QuicBindingInitialize(
+            UdpConfig,
+            NewBinding);
+    if (QUIC_FAILED(Status)) {
         goto Exit;
     }
 
@@ -2061,20 +2140,7 @@ NewBinding:
                 "Binding ephemeral port reuse encountered");
             QuicBindingUninitialize(*NewBinding);
             *NewBinding = NULL;
-
-#ifdef QUIC_SHARED_EPHEMERAL_WORKAROUND
-            //
-            // Use the invalid address as a starting point to search for a new
-            // one.
-            //
-            SharedEphemeralWorkAround = TRUE;
-            ((CXPLAT_UDP_CONFIG*)UdpConfig)->LocalAddress = &NewLocalAddress;
-            QuicAddrSetPort((QUIC_ADDR*)UdpConfig->LocalAddress, QuicAddrGetPort(UdpConfig->LocalAddress) + 1);
-            goto SharedEphemeralRetry;
-#else
-            Status = QUIC_STATUS_INTERNAL_ERROR;
-#endif // QUIC_SHARED_EPHEMERAL_WORKAROUND
-
+            Status = QUIC_STATUS_ADDRESS_IN_USE;
         } else if (Binding->Exclusive) {
             QuicTraceEvent(
                 BindingError,
@@ -2083,15 +2149,7 @@ NewBinding:
                 "Binding already in use");
             QuicBindingUninitialize(*NewBinding);
             *NewBinding = NULL;
-#ifdef QUIC_SHARED_EPHEMERAL_WORKAROUND
-            if (SharedEphemeralWorkAround) {
-                CXPLAT_DBG_ASSERT(UdpConfig->LocalAddress);
-                QuicAddrSetPort((QUIC_ADDR*)UdpConfig->LocalAddress, QuicAddrGetPort(UdpConfig->LocalAddress) + 1);
-                goto SharedEphemeralRetry;
-            }
-#endif // QUIC_SHARED_EPHEMERAL_WORKAROUND
             Status = QUIC_STATUS_ADDRESS_IN_USE;
-
         } else {
             QuicBindingUninitialize(*NewBinding);
             *NewBinding = Binding;
@@ -2102,6 +2160,163 @@ NewBinding:
 Exit:
 
     return Status;
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+QUIC_STATUS
+QuicLibraryCloneBinding(
+    _In_ QUIC_BINDING* ExistingBinding,
+    _Inout_ CXPLAT_ROUTE* Route,
+    _Out_ QUIC_BINDING** NewBinding
+    )
+{
+    QUIC_STATUS Status = QUIC_STATUS_NOT_FOUND;
+    QUIC_BINDING* Binding = NULL;
+    QUIC_LISTENER* ExistingListener = NULL;
+
+    CxPlatDispatchLockAcquire(&MsQuicLib.DatapathLock);
+
+    Binding =
+        QuicLibraryLookupBindingStrong(
+#ifdef QUIC_COMPARTMENT_ID
+            ExistingBinding->CompartmentId,
+#endif
+            &Route->LocalAddress,
+            &Route->RemoteAddress);
+    if (Binding != NULL) {
+        if (Binding->Exclusive || !Binding->ServerOwned) {
+            //
+            // The binding does already exist, but cannot be shared with the
+            // requested configuration.
+            //
+            QuicTraceEvent(
+                BindingError,
+                "[bind][%p] ERROR, %s.",
+                Binding,
+                "Binding already in use");
+            Status = QUIC_STATUS_ADDRESS_IN_USE;
+        } else {
+            //
+            // Match found and can be shared.
+            //
+            CXPLAT_DBG_ASSERT(Binding->RefCount > 0);
+            Binding->RefCount++;
+            *NewBinding = Binding;
+            Status = QUIC_STATUS_SUCCESS;
+        }
+    }
+
+    CxPlatDispatchLockRelease(&MsQuicLib.DatapathLock);
+
+    if (Status != QUIC_STATUS_NOT_FOUND) {
+        goto Exit;
+    }
+
+    CxPlatDispatchRwLockAcquireShared(&ExistingBinding->RwLock);
+
+    for (CXPLAT_LIST_ENTRY* Link = ExistingBinding->Listeners.Flink;
+        Link != &ExistingBinding->Listeners;
+        Link = Link->Flink) {
+        ExistingListener = CXPLAT_CONTAINING_RECORD(Link, QUIC_LISTENER, Link);
+        break;
+    }
+
+    CxPlatDispatchRwLockReleaseShared(&ExistingBinding->RwLock);
+
+    if (NULL == ExistingListener) {
+        goto Exit;
+    }
+
+    QUIC_LISTENER* NewListener;
+    Status = MsQuicListenerOpen((HQUIC)ExistingListener->Registration,
+        ExistingListener->ClientCallbackHandler,
+        ExistingListener->ClientContext,
+        (HQUIC*)&NewListener);
+    if (QUIC_FAILED(Status)) {
+        goto Exit;
+    }
+
+    NewListener->AlpnListLength = ExistingListener->AlpnListLength;
+    NewListener->AlpnList = CXPLAT_ALLOC_NONPAGED(NewListener->AlpnListLength, QUIC_POOL_ALPN);
+    if (NewListener->AlpnList == NULL) {
+        QuicTraceEvent(
+            AllocFailure,
+            "Allocation of '%s' failed. (%llu bytes)",
+            "AlpnList" ,
+            NewListener->AlpnListLength);
+        Status = QUIC_STATUS_OUT_OF_MEMORY;
+        goto ExitListener;
+    }
+    CxPlatCopyMemory(
+        NewListener->AlpnList,
+        ExistingListener->AlpnList,
+        NewListener->AlpnListLength);
+
+    CxPlatCopyMemory(&NewListener->LocalAddress, &Route->LocalAddress, sizeof(QUIC_ADDR));
+    NewListener->WildCard = QuicAddrIsWildCard(&Route->LocalAddress);
+
+    CXPLAT_UDP_CONFIG UdpConfig = {0};
+    UdpConfig.LocalAddress = &Route->LocalAddress;
+    UdpConfig.RemoteAddress = &Route->RemoteAddress;
+    UdpConfig.Flags = CXPLAT_SOCKET_FLAG_SHARE | CXPLAT_SOCKET_SERVER_OWNED; // Listeners always share the binding.
+    UdpConfig.InterfaceIndex = 0;
+#ifdef QUIC_COMPARTMENT_ID
+    UdpConfig.CompartmentId = ExistingBinding->CompartmentId;
+#endif
+#ifdef QUIC_OWNING_PROCESS
+    UdpConfig.OwningProcess = NULL;     // Owning process not supported for listeners.
+#endif
+
+    // for RAW datapath
+    UdpConfig.CibirIdLength = ExistingListener->CibirId[0];
+    UdpConfig.CibirIdOffsetSrc = MsQuicLib.CidServerIdLength + 2;
+    UdpConfig.CibirIdOffsetDst = MsQuicLib.CidServerIdLength + 2;
+    if (UdpConfig.CibirIdLength) {
+        CXPLAT_DBG_ASSERT(UdpConfig.CibirIdLength <= sizeof(UdpConfig.CibirId));
+        CxPlatCopyMemory(
+            UdpConfig.CibirId,
+            &ExistingListener->CibirId[2],
+            UdpConfig.CibirIdLength);
+    }
+
+    Status = QuicLibraryCreateBinding(&UdpConfig, NewBinding);
+    if (QUIC_STATUS_ADDRESS_IN_USE == Status)
+        Status = QuicLibraryGetBinding(&UdpConfig, NewBinding);
+    if (QUIC_FAILED(Status)) {
+        goto ExitListener;
+    }
+    NewListener->Binding = *NewBinding;
+    NewListener->Stopped = FALSE;
+    CxPlatEventReset(NewListener->StopEvent);
+    CxPlatRefInitialize(&NewListener->RefCount);
+    CxPlatSocketSetRoute(NewListener->Binding->Socket, Route);
+    Status = QuicBindingRegisterListener(NewListener->Binding, NewListener);
+    if (QUIC_FAILED(Status)) {
+        QuicTraceEvent(
+            ListenerErrorStatus,
+            "[list][%p] ERROR, %u, %s.",
+            NewListener,
+            Status,
+            "Register with binding");
+        goto ExitListener;
+    }
+
+Exit:
+
+    return Status;
+
+ExitListener:
+    if (NewListener->Binding != NULL) {
+        QuicLibraryReleaseBinding(NewListener->Binding);
+        NewListener->Binding = NULL;
+    }
+    if (NewListener->AlpnList != NULL) {
+        CXPLAT_FREE(NewListener->AlpnList, QUIC_POOL_ALPN);
+        NewListener->AlpnList = NULL;
+    }
+    NewListener->AlpnListLength = 0;
+    QuicListenerRelease(NewListener, FALSE);
+    goto Exit;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

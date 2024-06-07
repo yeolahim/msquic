@@ -249,6 +249,16 @@ CxPlatSocketGetRemoteAddress(
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 void
+CxPlatSocketSetRoute(
+    _In_ CXPLAT_SOCKET* Socket,
+    _Inout_ CXPLAT_ROUTE* Route
+    )
+{
+    Route->Queue = &Socket->SocketContexts[0];
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+void
 CxPlatRecvDataReturn(
     _In_opt_ CXPLAT_RECV_DATA* RecvDataChain
     )

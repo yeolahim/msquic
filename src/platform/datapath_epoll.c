@@ -168,14 +168,15 @@ typedef struct CXPLAT_SEND_DATA {
     alignas(8)
     char ControlBuffer[
         CMSG_SPACE(sizeof(int)) +               // IP_TOS || IPV6_TCLASS
-        CMSG_SPACE(sizeof(struct in6_pktinfo))  // IP_PKTINFO || IPV6_PKTINFO
+        CMSG_SPACE(sizeof(struct in6_pktinfo)) +  // IP_PKTINFO || IPV6_PKTINFO
+        CMSG_SPACE(sizeof(struct sockaddr_in6)) + 
     #ifdef UDP_SEGMENT
         + CMSG_SPACE(sizeof(uint16_t))          // UDP_SEGMENT
     #endif
         ];
     CXPLAT_STATIC_ASSERT(
-        CMSG_SPACE(sizeof(struct in6_pktinfo)) >= CMSG_SPACE(sizeof(struct in_pktinfo)),
-        "sizeof(struct in6_pktinfo) >= sizeof(struct in_pktinfo) failed");
+        CMSG_SPACE(sizeof(struct sockaddr_in6)) >= CMSG_SPACE(sizeof(struct in6_pktinfo)),
+        "sizeof(struct sockaddr_in6) >= sizeof(struct in6_pktinfo) failed");
 
     //
     // Space for all the packet buffers.
@@ -197,7 +198,7 @@ typedef struct CXPLAT_SEND_DATA {
 } CXPLAT_SEND_DATA;
 
 typedef struct CXPLAT_RECV_MSG_CONTROL_BUFFER {
-    char Data[CMSG_SPACE(sizeof(struct in6_pktinfo)) +
+    char Data[CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(struct sockaddr_in6)) +
               2 * CMSG_SPACE(sizeof(int))];
 } CXPLAT_RECV_MSG_CONTROL_BUFFER;
 
@@ -253,7 +254,7 @@ CxPlatDataPathCalculateFeatureSupport(
     *((uint16_t*)CMSG_DATA(CMsg)) = 1476;
     RecvAddr.sin_family = AF_INET;
     RecvAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    char RecvControlBuffer[CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct in6_pktinfo))] = {0};
+    char RecvControlBuffer[CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(struct sockaddr_in6))] = {0};
     struct msghdr RecvMsg = {0};
     RecvMsg.msg_name = &RecvAddr2;
     RecvMsg.msg_namelen = RecvAddr2Size;
@@ -710,6 +711,28 @@ CxPlatSocketContextInitialize(
     }
 
 
+    //
+    // Set transparent socket mode.
+    //
+    Option = 1;
+    Result =
+        setsockopt(
+            SocketContext->SocketFd,
+            SOL_IPV6,
+            IPV6_TRANSPARENT,
+            (const void*)&Option,
+            sizeof(Option));
+    if (Result == SOCKET_ERROR) {
+        Status = errno;
+        QuicTraceEvent(
+            DatapathErrorStatus,
+            "[data][%p] ERROR, %u, %s.",
+            Binding,
+            Status,
+            "setsockopt(IP_TRANSPARENT) failed");
+        goto Exit;
+    }
+
     if (SocketType == CXPLAT_SOCKET_UDP) {
         //
         // Set DON'T FRAG socket option.
@@ -804,6 +827,62 @@ CxPlatSocketContextInitialize(
             goto Exit;
         }
 
+        Option = TRUE;
+        Result =
+            setsockopt(
+                SocketContext->SocketFd,
+                SOL_IP,
+                IP_RECVORIGDSTADDR,
+                (const void*)&Option,
+                sizeof(Option));
+        if (Result == SOCKET_ERROR) {
+            Status = errno;
+            QuicTraceEvent(
+                DatapathErrorStatus,
+                "[data][%p] ERROR, %u, %s.",
+                Binding,
+                Status,
+                "setsockopt(IP_RECVORIGDSTADDR) failed");
+            goto Exit;
+        }
+    
+        Option = TRUE;
+        Result =
+            setsockopt(
+                SocketContext->SocketFd,
+                SOL_IPV6,
+                IPV6_RECVORIGDSTADDR,
+                (const void*)&Option,
+                sizeof(Option));
+        if (Result == SOCKET_ERROR) {
+            Status = errno;
+            QuicTraceEvent(
+                DatapathErrorStatus,
+                "[data][%p] ERROR, %u, %s.",
+                Binding,
+                Status,
+                "setsockopt(IPV6_RECVORIGDSTADDR) failed");
+            goto Exit;
+        }
+
+        Option = TRUE;
+        Result =
+            setsockopt(
+                SocketContext->SocketFd,
+                SOL_IPV6,
+                IPV6_FREEBIND,
+                (const void*)&Option,
+                sizeof(Option));
+        if (Result == SOCKET_ERROR) {
+            Status = errno;
+            QuicTraceEvent(
+                DatapathErrorStatus,
+                "[data][%p] ERROR, %u, %s.",
+                Binding,
+                Status,
+                "setsockopt(IPV6_FREEBIND) failed");
+            goto Exit;
+        }
         //
         // Set socket option to receive TOS (= DSCP + ECN) information from the
         // incoming packet.
@@ -1685,7 +1764,7 @@ CxPlatSocketContextRecvComplete(
 
         uint8_t TOS = 0;
         uint16_t SegmentLength = 0;
-        BOOLEAN FoundLocalAddr = FALSE, FoundTOS = FALSE;
+        BOOLEAN FoundLocalAddr = FALSE, FoundLocalAddr4 = FALSE, FoundTOS = FALSE;
         QUIC_ADDR* LocalAddr = &IoBlock->Route.LocalAddress;
         QUIC_ADDR* RemoteAddr = &IoBlock->Route.RemoteAddress;
         CxPlatConvertFromMappedV6(RemoteAddr, RemoteAddr);
@@ -1703,8 +1782,17 @@ CxPlatSocketContextRecvComplete(
                     LocalAddr->Ip.sa_family = QUIC_ADDRESS_FAMILY_INET6;
                     LocalAddr->Ipv6.sin6_addr = PktInfo6->ipi6_addr;
                     LocalAddr->Ipv6.sin6_port = SocketContext->Binding->LocalAddress.Ipv6.sin6_port;
-                    CxPlatConvertFromMappedV6(LocalAddr, LocalAddr);
+                    if (!FoundLocalAddr4)
+                        CxPlatConvertFromMappedV6(LocalAddr, LocalAddr);
                     LocalAddr->Ipv6.sin6_scope_id = PktInfo6->ipi6_ifindex;
+                    FoundLocalAddr = TRUE;
+                } else if (CMsg->cmsg_type == IPV6_ORIGDSTADDR) {
+                    struct sockaddr_in6* addr = (struct sockaddr_in6*)CMSG_DATA(CMsg);
+                    LocalAddr->Ip.sa_family = addr->sin6_family;
+                    LocalAddr->Ipv6.sin6_addr = addr->sin6_addr;
+                    LocalAddr->Ipv6.sin6_port = addr->sin6_port;; //SocketContext->Binding->LocalAddress.Ipv6.sin6_port;
+                    CxPlatConvertFromMappedV6(LocalAddr, LocalAddr);
+                    LocalAddr->Ipv6.sin6_scope_id = addr->sin6_scope_id;
                     FoundLocalAddr = TRUE;
                 } else if (CMsg->cmsg_type == IPV6_TCLASS) {
                     CXPLAT_DBG_ASSERT_CMSG(CMsg, uint8_t);
@@ -1718,6 +1806,10 @@ CxPlatSocketContextRecvComplete(
                     CXPLAT_DBG_ASSERT_CMSG(CMsg, uint8_t);
                     TOS = *(uint8_t*)CMSG_DATA(CMsg);
                     FoundTOS = TRUE;
+                } else if (CMsg->cmsg_type == IP_ORIGDSTADDR) {
+                    CXPLAT_DBG_ASSERT_CMSG(CMsg, uint8_t);
+                    LocalAddr->Ipv4 = *(struct sockaddr_in*)CMSG_DATA(CMsg);
+                    FoundLocalAddr4 = TRUE;
                 } else {
                     CXPLAT_DBG_ASSERT(FALSE);
                 }
@@ -1734,6 +1826,7 @@ CxPlatSocketContextRecvComplete(
         }
 
         CXPLAT_FRE_ASSERT(FoundLocalAddr);
+        CXPLAT_FRE_ASSERT(FoundLocalAddr4);
         CXPLAT_FRE_ASSERT(FoundTOS);
 
         QuicTraceEvent(
@@ -2349,8 +2442,25 @@ CxPlatSendDataPopulateAncillaryData(
             PktInfo6->ipi6_ifindex = SendData->LocalAddress.Ipv6.sin6_scope_id;
             PktInfo6->ipi6_addr = SendData->LocalAddress.Ipv6.sin6_addr;
         }
-    }
 
+        QuicTraceEvent(
+        DatapathSend,
+        "[data!!!!] Src=%!ADDR!",
+            CASTED_CLOG_BYTEARRAY(sizeof(SendData->LocalAddress), &SendData->LocalAddress));
+    } else {
+        // Mhdr->msg_controllen += CMSG_SPACE(sizeof(struct sockaddr_in));
+        // CMsg = CXPLAT_CMSG_NXTHDR(CMsg);
+        // CMsg->cmsg_level = IPPROTO_IP;
+        // CMsg->cmsg_type = IP_ORIGDSTADDR;
+        // CMsg->cmsg_len = CMSG_LEN(sizeof(struct sockaddr_in));
+        // struct sockaddr_in *addr = (struct sockaddr_in*)CMSG_DATA(CMsg);
+        // *addr = SendData->LocalAddress.Ipv4;
+        QuicTraceEvent(
+        DatapathSend,
+        "[data] Dst=%!ADDR!, Src=%!ADDR!",
+            CASTED_CLOG_BYTEARRAY(sizeof(SendData->RemoteAddress), &SendData->RemoteAddress),
+            CASTED_CLOG_BYTEARRAY(sizeof(SendData->LocalAddress), &SendData->LocalAddress));
+    }
 #ifdef UDP_SEGMENT
     if (SendData->SegmentationSupported && SendData->SegmentSize > 0) {
         Mhdr->msg_controllen += CMSG_SPACE(sizeof(uint16_t));

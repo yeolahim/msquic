@@ -1288,6 +1288,15 @@ QuicBindingCreateConnection(
 
     QuicConnAddRef(NewConnection, QUIC_CONN_REF_LOOKUP_RESULT);
 
+    QUIC_ADDR BindingLocalAddr;
+    QuicBindingGetLocalAddress(Binding, &BindingLocalAddr);
+    if (!QuicAddrCompare(&Packet->Route->LocalAddress, &BindingLocalAddr)) {
+        QUIC_STATUS Status = QuicLibraryCloneBinding(Binding, &NewConnection->Paths[0].Route, &Binding);
+        if (QUIC_FAILED(Status)) {
+            QuicPacketLogDrop(Binding, Packet, "Failed to initialize new connection binding");
+            goto Exit;
+        }
+    }
     //
     // Even though the new connection might not end up being put in this
     // binding's lookup table, it must be completely set up before it is
@@ -1319,6 +1328,12 @@ QuicBindingCreateConnection(
         goto Exit;
     }
 
+    QuicTraceEvent(
+        PacketReceive,
+        "[conn][%p] Dst=%!ADDR!, Src=%!ADDR!",
+        NewConnection,
+        CASTED_CLOG_BYTEARRAY(sizeof(Packet->Route->RemoteAddress), &Packet->Route->RemoteAddress),
+        CASTED_CLOG_BYTEARRAY(sizeof(Packet->Route->LocalAddress), &Packet->Route->LocalAddress));
     QuicWorkerQueueConnection(NewConnection->Worker, NewConnection);
 
     return NewConnection;
@@ -1827,6 +1842,13 @@ QuicBindingSend(
         }
     } else {
 #endif
+        QuicTraceEvent(
+            PacketSend,
+            "[bind][%p] Dst=%!ADDR!, Src=%!ADDR!",
+            Binding,
+            CASTED_CLOG_BYTEARRAY(sizeof(Route->RemoteAddress), &Route->RemoteAddress),
+            CASTED_CLOG_BYTEARRAY(sizeof(Route->LocalAddress), &Route->LocalAddress));
+
         Status =
             CxPlatSocketSend(
                 Binding->Socket,
